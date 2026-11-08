@@ -68,7 +68,8 @@ def send_number(sock, number, log, label):
     text = format(number, 'x') + '\n'
     record(log, 'OUT', text)
     sock.sendall(text.encode('ascii'))
-    print(f'{label} отправлено: {text.strip()}', flush=True)
+    if label:
+        print(f'{label} отправлено: {text.strip()}', flush=True)
 
 
 def receive_number(sock, p, log, label):
@@ -92,7 +93,8 @@ def receive_number(sock, p, log, label):
     value = int(digits, 16)
     if not 1 <= value < p:
         raise ValueError('Полученное число вне диапазона от 1 до p-1')
-    print(f'{label} получено: {digits.decode("ascii")}', flush=True)
+    if label:
+        print(f'{label} получено: {digits.decode("ascii")}', flush=True)
     return value
 
 
@@ -100,3 +102,43 @@ def save_key(key_path, key):
     key_path.write_bytes(key)
     print(f'Ключ сохранён: {key_path} (32 байта = 256 бит)')
     print(f'SHA-256: {hashlib.sha256(key).hexdigest()}', flush=True)
+
+
+def chat(sock, p, c, d, log, first):
+    print('Чат по очереди, сначала Алиса. До 200 байт UTF-8; /exit — выход.', flush=True)
+    sock.settimeout(None)  # Ввод человека может занять сколько угодно времени.
+    while True:
+        if first:
+            while True:
+                try:
+                    text = input('Вы: ')
+                except EOFError:
+                    text = '/exit'
+                if text == '/exit':
+                    m = 1  # Служебное значение для завершения чата.
+                    break
+                if not text:
+                    continue
+                data = text.encode('utf-8')
+                if len(data) <= 200:
+                    m = int.from_bytes(b'\x01' + data, 'big')
+                    break
+                print('Слишком длинно: максимум 200 байт UTF-8.')
+            # Отправитель накладывает своё преобразование, затем снимает его.
+            send_number(sock, pow(m, c, p), log, '')
+            x2 = receive_number(sock, p, log, '')
+            send_number(sock, pow(x2, d, p), log, '')
+        else:
+            # Получатель добавляет своё преобразование, затем снимает его.
+            x1 = receive_number(sock, p, log, '')
+            send_number(sock, pow(x1, c, p), log, '')
+            m = pow(receive_number(sock, p, log, ''), d, p)
+            if m != 1:
+                data = m.to_bytes((m.bit_length() + 7) // 8, 'big')
+                if data[:1] != b'\x01' or len(data) > 201:
+                    raise ValueError('Неверный формат сообщения')
+                print('Собеседник: ' + data[1:].decode('utf-8'), flush=True)
+        if m == 1:
+            print('Чат завершён', flush=True)
+            return
+        first = not first

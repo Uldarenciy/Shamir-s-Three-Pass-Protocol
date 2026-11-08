@@ -2,7 +2,7 @@
 import secrets
 import socket
 from protocol import (load_p, settings, prepare, key_to_number,
-                      send_number, receive_number, save_key)
+                      send_number, receive_number, save_key, chat)
 
 
 def main():
@@ -18,7 +18,8 @@ def main():
             x2 = receive_number(sock, p, log, 'x2')  # 2. Боб добавил своё преобразование.
             x3 = pow(x2, d_a, p)                    # 3. Снимаем преобразование Алисы.
             send_number(sock, x3, log, 'x3')
-    save_key(key_path, key)
+            save_key(key_path, key)
+            chat(sock, p, c_a, d_a, log, first=True)
 
 
 if __name__ == '__main__':

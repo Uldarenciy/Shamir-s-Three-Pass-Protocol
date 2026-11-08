@@ -1,7 +1,7 @@
 """Боб принимает ключ Алисы. Сначала запустите этот файл."""
 import socket
 from protocol import (load_p, settings, prepare, number_to_key,
-                      send_number, receive_number, save_key)
+                      send_number, receive_number, save_key, chat)
 
 
 def main():
@@ -22,7 +22,8 @@ def main():
             x3 = receive_number(sock, p, log, 'x3')  # 3. Алиса сняла своё преобразование.
             m = pow(x3, d_b, p)                     # Снимаем преобразование Боба локально.
             key = number_to_key(m)
-    save_key(key_path, key)
+            save_key(key_path, key)
+            chat(sock, p, c_b, d_b, log, first=False)
 
 
 if __name__ == '__main__':
