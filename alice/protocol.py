@@ -1,17 +1,21 @@
-"""Вспомогательные функции участника alice. Шаги протокола — в alice.py."""
+"""Математика, три прохода Шамира и журналирование для alice."""
 import argparse
 import hashlib
+import os
+import select
+import sys
 import json
 import math
 import secrets
 from datetime import datetime
 from pathlib import Path
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 BASE = Path(__file__).resolve().parent
 
 
-def load_p():
-    # Заранее выбранное простое p из RFC 3526, группа 14.
+def load_p(): # загрузка p
     data = json.loads((BASE / 'parameters.json').read_text(encoding='utf-8'))
     p = int(data['p'], 16)
     if p.bit_length() != 2048 or p % 2 == 0:
@@ -19,43 +23,37 @@ def load_p():
     return p
 
 
-def settings(role):
+def settings(role): # файл для участинка и данные конфига(порт и т.д.)
     parser = argparse.ArgumentParser(description=f'Протокол Шамира: {role}')
     parser.add_argument('--config', type=Path, default=BASE / f'{role}.json')
-    path = parser.parse_args().config.resolve()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--initiate', dest='initiate', action='store_true', help='создать и передать K')
+    mode.add_argument('--receive-key', dest='initiate', action='store_false', help='принять K')
+    parser.set_defaults(initiate=(role == 'alice'))
+    args = parser.parse_args()
+    path = args.config.resolve()
     config = json.loads(path.read_text(encoding='utf-8'))
     if not 1 <= config['port'] <= 65535 or config['timeout'] <= 0:
         raise ValueError('Порт должен быть 1–65535, тайм-аут — больше нуля')
-    # Относительный каталог считается от файла настроек, а не от терминала.
+    config['initiate'] = args.initiate
     return config, path.parent / config['directory']
 
 
-def make_exponents(p):
+def make_exponents(p): # вычисляем обратное число, если НОД = 1 нашли
     while True:
-        c = secrets.randbelow(p - 3) + 2
-        if math.gcd(c, p - 1) == 1:
-            return c, pow(c, -1, p - 1)
+        a = secrets.randbelow(p - 3) + 2
+        if math.gcd(a, p - 1) == 1:
+            d_A = pow(a, -1, p - 1)
+            return a, d_A
 
 
-def key_to_number(key):
-    if len(key) != 32:
-        raise ValueError('Ключ должен содержать ровно 32 байта')
-    return int.from_bytes(key, 'big') + 1  # m != 0 даже для нулевого ключа.
-
-
-def number_to_key(number):
-    if not 1 <= number <= 2 ** 256:
-        raise ValueError('Не удалось восстановить 256-битный ключ')
-    return (number - 1).to_bytes(32, 'big')  # Сохраняем ведущие нули.
-
-
-def prepare(directory, p):
+def prepare(directory, p): # параметры a, d_A
     directory.mkdir(parents=True, exist_ok=True)
     name = datetime.now().strftime('%Y%m%d_%H%M%S_') + secrets.token_hex(3)
-    c, d = make_exponents(p)
-    private = {'c': hex(c), 'd': hex(d)}
+    a, d_A = make_exponents(p)
+    private = {'a': hex(a), 'd_A': hex(d_A)}
     (directory / f'private_{name}.json').write_text(json.dumps(private, indent=2), encoding='utf-8')
-    return c, d, directory / f'key_{name}.key', directory / f'exchange_{name}.jsonl'
+    return a, d_A, directory / f'key_{name}.key', directory / f'exchange_{name}.jsonl'
 
 
 def record(log, direction, data):
@@ -64,81 +62,117 @@ def record(log, direction, data):
     log.flush()
 
 
-def send_number(sock, number, log, label):
-    text = format(number, 'x') + '\n'
+def send_line(sock, text, log):
+    text += '\n'
     record(log, 'OUT', text)
     sock.sendall(text.encode('ascii'))
-    if label:
-        print(f'{label} отправлено: {text.strip()}', flush=True)
 
 
-def receive_number(sock, p, log, label):
-    # TCP — поток байтов; одно число заканчивается переводом строки.
+def receive_line(sock, log, limit=513):
     data = bytearray()
     try:
         while not data.endswith(b'\n'):
             chunk = sock.recv(1)
             if not chunk:
-                raise ConnectionError('Другой участник закрыл соединение')
+                raise ConnectionError('Собеседник закрыл соединение')
             data.extend(chunk)
-            if len(data) > 513:  # 512 hex-цифр для 2048 бит и перевод строки.
-                raise ValueError('Слишком длинное число')
+            if len(data) > limit:
+                raise ValueError('Слишком длинное сообщение')
     except (OSError, ValueError):
         record(log, 'IN_PARTIAL', data.decode('ascii', errors='backslashreplace'))
         raise
     record(log, 'IN', data.decode('ascii', errors='backslashreplace'))
-    digits = data[:-1]
-    if not digits or any(ch not in b'0123456789abcdefABCDEF' for ch in digits):
-        raise ValueError('Ожидалось шестнадцатеричное число')
-    value = int(digits, 16)
+    return data.decode('ascii').strip()
+
+
+def send_number(sock, number, log):
+    send_line(sock, format(number, 'x'), log)
+
+
+def receive_number(sock, p, log):
+    value = int(receive_line(sock, log), 16)
     if not 1 <= value < p:
         raise ValueError('Полученное число вне диапазона от 1 до p-1')
-    if label:
-        print(f'{label} получено: {digits.decode("ascii")}', flush=True)
     return value
 
 
-def save_key(key_path, key):
-    key_path.write_bytes(key)
-    print(f'Ключ сохранён: {key_path} (32 байта = 256 бит)')
-    print(f'SHA-256: {hashlib.sha256(key).hexdigest()}', flush=True)
+def exchange_key(sock, p, a, d_A, log, initiate):
+    # Оба сообщают роль: ровно одна сторона должна создавать K.
+    mode = 'INITIATE' if initiate else 'RECEIVE'
+    send_line(sock, mode, log)
+    peer = receive_line(sock, log, 16)
+    if peer not in ('INITIATE', 'RECEIVE') or peer == mode:
+        raise ValueError('Нужен ровно один инициатор: --initiate и --receive-key')
+    if initiate:
+        K = secrets.token_bytes(32)
+        m = int.from_bytes(K, 'big') + 1
+        x1 = pow(m, a, p)
+        send_number(sock, x1, log)              # 1. Преобразование инициатора.
+        x2 = receive_number(sock, p, log)      # 2. Получатель добавил своё.
+        x3 = pow(x2, d_A, p)
+        send_number(sock, x3, log)             # 3. Инициатор снял своё.
+    else:
+        x1 = receive_number(sock, p, log)
+        x2 = pow(x1, a, p)
+        send_number(sock, x2, log)
+        x3 = receive_number(sock, p, log)
+        m = pow(x3, d_A, p)                # 4. Получатель снимает своё локально.
+        if not 1 <= m <= 2 ** 256:
+            raise ValueError('Не удалось восстановить сеансовый ключ')
+        K = (m - 1).to_bytes(32, 'big')
+    return K
 
 
-def chat(sock, p, c, d, log, first):
-    print('Чат по очереди, сначала Алиса. До 200 байт UTF-8; /exit — выход.', flush=True)
-    sock.settimeout(None)  # Ввод человека может занять сколько угодно времени.
+def save_key(key_path, K):
+    key_path.write_bytes(K)
+    print(f'Ключ 256 бит сохранён: {key_path}', flush=True)
+    print(f'SHA-256: {hashlib.sha256(K).hexdigest()}', flush=True)
+
+
+def chat(sock, K, log, role):
+    cipher = AESGCM(K)
+    prefix = b'A' if role == 'alice' else b'B'
+    peer_prefix = b'B' if role == 'alice' else b'A'
+    sent = received = 0
+    pending = b''
+    sock.settimeout(None)
+    print('Чат готов. Писать можно в любой момент; /exit — выход.', flush=True)
+    print('Вы: ', end='', flush=True)
     while True:
-        if first:
-            while True:
-                try:
-                    text = input('Вы: ')
-                except EOFError:
-                    text = '/exit'
-                if text == '/exit':
-                    m = 1  # Служебное значение для завершения чата.
-                    break
+        ready, _, _ = select.select([sock, sys.stdin], [], [])
+        if sock in ready:
+            packet = bytes.fromhex(receive_line(sock, log, 2 * (65536 + 28) + 1))
+            # Направление и счётчик исключают повтор nonce с одним ключом.
+            nonce = peer_prefix + received.to_bytes(11, 'big')
+            if packet[:12] != nonce:
+                raise ValueError('Неверный номер сообщения')
+            try:
+                text = cipher.decrypt(nonce, packet[12:], None).decode('utf-8')
+            except InvalidTag:
+                raise ValueError('Сообщение повреждено или ключи не совпадают') from None
+            received += 1
+            if text == '/exit':
+                print('\nСобеседник завершил чат', flush=True)
+                return
+            print('\nСобеседник: ' + text + '\nВы: ', end='', flush=True)
+        if sys.stdin in ready:
+            # Читаем байты, чтобы вставка нескольких строк не застревала в буфере stdin.
+            pending += os.read(sys.stdin.fileno(), 4096) or b'\n/exit\n'
+            while b'\n' in pending:
+                data, pending = pending.split(b'\n', 1)
+                text = data.decode('utf-8').rstrip('\r')
                 if not text:
                     continue
-                data = text.encode('utf-8')
-                if len(data) <= 200:
-                    m = int.from_bytes(b'\x01' + data, 'big')
-                    break
-                print('Слишком длинно: максимум 200 байт UTF-8.')
-            # Отправитель накладывает своё преобразование, затем снимает его.
-            send_number(sock, pow(m, c, p), log, '')
-            x2 = receive_number(sock, p, log, '')
-            send_number(sock, pow(x2, d, p), log, '')
-        else:
-            # Получатель добавляет своё преобразование, затем снимает его.
-            x1 = receive_number(sock, p, log, '')
-            send_number(sock, pow(x1, c, p), log, '')
-            m = pow(receive_number(sock, p, log, ''), d, p)
-            if m != 1:
-                data = m.to_bytes((m.bit_length() + 7) // 8, 'big')
-                if data[:1] != b'\x01' or len(data) > 201:
-                    raise ValueError('Неверный формат сообщения')
-                print('Собеседник: ' + data[1:].decode('utf-8'), flush=True)
-        if m == 1:
-            print('Чат завершён', flush=True)
-            return
-        first = not first
+                if len(data) > 65536:
+                    print('Фраза слишком длинная: максимум 64 КиБ.', flush=True)
+                    continue
+                nonce = prefix + sent.to_bytes(11, 'big')
+                packet = nonce + cipher.encrypt(nonce, text.encode('utf-8'), None)
+                send_line(sock, packet.hex(), log)
+                sent += 1
+                if text == '/exit':
+                    print('Чат завершён', flush=True)
+                    return
+                print('Вы: ', end='', flush=True)
+            if len(pending) > 65536:
+                raise ValueError('Фраза слишком длинная: максимум 64 КиБ')
